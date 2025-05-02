@@ -7,3 +7,4 @@ src/test_crypto
 target
 Cargo.lock
 /powertag2influx
+vendor
