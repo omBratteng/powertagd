@@ -7,8 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv" // Added for parsing numbers
+	"strconv"
 	"strings"
+	"sync" // Added for concurrency safety (if needed, though the current loop is sequential)
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -17,9 +18,8 @@ import (
 
 const ProgName string = "powertag2influx"
 
-// Define a struct to represent the data we want to send to MQTT
-// We'll use more specific field names based on the sample data
-type PowerTagData struct {
+// Define a struct to hold the full state for a PowerTag device
+type PowerTagState struct {
 	VoltageP1          float64 `json:"voltage_p1,omitempty"`
 	CurrentP1          float64 `json:"current_p1,omitempty"`
 	TotalPowerActive   float64 `json:"total_power_active,omitempty"`
@@ -27,8 +27,15 @@ type PowerTagData struct {
 	TotalPowerApparent float64 `json:"total_power_apparent,omitempty"`
 	Freq               float64 `json:"freq,omitempty"`
 	PowerFactor        float64 `json:"power_factor,omitempty"`
-	// Add other relevant fields if needed
+	Serial             string  `json:"serial,omitempty"` // Added serial
+	FwVer              string  `json:"fw_ver,omitempty"` // Added firmware version
+	HwVer              string  `json:"hw_ver,omitempty"` // Added hardware version
+	// Add other relevant fields you want to track and send
 }
+
+// Map to hold the current state for each device, keyed by device ID
+var deviceStates map[string]*PowerTagState
+var statesMutex sync.Mutex // Mutex to protect access to deviceStates (good practice)
 
 func main() {
 	var url string
@@ -78,8 +85,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("Debug: InfluxDB URL is: '%s'\n", url)
-
 	// --- InfluxDB Client Setup ---
 	opts := influxdb2.DefaultOptions()
 	opts.SetApplicationName(ProgName)
@@ -124,6 +129,12 @@ func main() {
 			mqttOpts.SetPassword(mqttPassword)
 		}
 
+		// Set a reasonable reconnect interval
+		mqttOpts.SetKeepAlive(60 * time.Second)
+		mqttOpts.SetPingTimeout(1 * time.Second)
+		mqttOpts.SetConnectRetryInterval(2 * time.Second)
+		mqttOpts.SetAutoReconnect(true)
+
 		mqttClient = mqtt.NewClient(mqttOpts)
 		if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
 			fmt.Fprintf(os.Stderr, "%s: failed connecting to MQTT broker at %s: %v\n", ProgName, mqttBroker, token.Error())
@@ -138,6 +149,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s: warning: both --mqtt-broker and --mqtt-topic-prefix must be specified to enable MQTT\n", ProgName)
 	}
 
+	// Initialize the device states map
+	deviceStates = make(map[string]*PowerTagState)
+
 	// --- Read from Stdin and Process ---
 	lnscan := bufio.NewScanner(os.Stdin)
 	for lnscan.Scan() {
@@ -149,20 +163,33 @@ func main() {
 		// Process for MQTT if enabled and client is connected
 		if mqttEnabled && mqttClient.IsConnected() {
 			// Attempt to parse the InfluxDB line protocol for MQTT
-			deviceID, powerTagData, parseErr := parseInfluxLineForMQTT(line)
+			deviceID, parsedFields, parseErr := parseInfluxLineForMQTT(line)
 			if parseErr != nil {
 				fmt.Fprintf(os.Stderr, "%s: failed to parse influxdb line for mqtt: %v (line: %s)\n", ProgName, parseErr, line)
 				// Continue processing the next line
 				continue
 			}
 
+			// Update the in-memory state for the device
+			statesMutex.Lock() // Lock to protect concurrent access
+			if _, ok := deviceStates[deviceID]; !ok {
+				// If the device is not in the map, initialize its state
+				deviceStates[deviceID] = &PowerTagState{}
+			}
+			// Apply the parsed fields to the device's state
+			updateDeviceState(deviceStates[deviceID], parsedFields)
+			statesMutex.Unlock() // Unlock after updating
+
 			// Construct the MQTT topic using the prefix and device ID
 			mqttTopic := fmt.Sprintf("%s/%s/state", strings.TrimSuffix(mqttTopicPrefix, "/"), deviceID)
 
-			// Marshal the data into JSON
-			jsonData, marshalErr := json.Marshal(powerTagData)
+			// Marshal the *full* current state into JSON
+			statesMutex.Lock() // Lock while accessing the state for marshaling
+			jsonData, marshalErr := json.Marshal(deviceStates[deviceID])
+			statesMutex.Unlock() // Unlock after marshaling
+
 			if marshalErr != nil {
-				fmt.Fprintf(os.Stderr, "%s: failed to marshal power data to json: %v\n", ProgName, marshalErr)
+				fmt.Fprintf(os.Stderr, "%s: failed to marshal device state to json for device %s: %v\n", ProgName, deviceID, marshalErr)
 				// Continue processing the next line
 				continue
 			}
@@ -171,7 +198,7 @@ func main() {
 			token := mqttClient.Publish(mqttTopic, 0, false, jsonData) // QoS 0, not retained
 			token.Wait()
 			if token.Error() != nil {
-				fmt.Fprintf(os.Stderr, "%s: mqtt publish error: %v\n", ProgName, token.Error())
+				fmt.Fprintf(os.Stderr, "%s: mqtt publish error for device %s: %v\n", ProgName, deviceID, token.Error())
 			}
 		}
 	}
@@ -180,12 +207,21 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s: error reading from stdin: %v\n", ProgName, err)
 		os.Exit(1)
 	}
+
+	// Ensure all buffered InfluxDB points are flushed before exiting
+	writeAPI.Flush()
+	client.Close() // Explicitly close client for InfluxDB
+
+	// Disconnect MQTT client if connected (defer handles this too, but explicit is fine)
+	if mqttClient != nil && mqttClient.IsConnected() {
+		mqttClient.Disconnect(250)
+	}
 }
 
 // parseInfluxLineForMQTT attempts to parse an InfluxDB Line Protocol string
-// and extract the device ID and relevant power-related fields.
-// It returns the device ID, a PowerTagData struct, and an error.
-func parseInfluxLineForMQTT(line string) (string, *PowerTagData, error) {
+// and extract the device ID and a map of the fields.
+// It returns the device ID, a map of field key-value pairs, and an error.
+func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error) {
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
 		return "", nil, fmt.Errorf("invalid influxdb line protocol: not enough parts")
@@ -215,7 +251,7 @@ func parseInfluxLineForMQTT(line string) (string, *PowerTagData, error) {
 	fieldsStr := parts[1]
 	fieldPairs := strings.Split(fieldsStr, ",")
 
-	powerTagData := &PowerTagData{}
+	parsedFields := make(map[string]interface{})
 
 	for _, pair := range fieldPairs {
 		keyValue := strings.SplitN(pair, "=", 2)
@@ -225,67 +261,98 @@ func parseInfluxLineForMQTT(line string) (string, *PowerTagData, error) {
 		key := keyValue[0]
 		valueStr := keyValue[1]
 
-		// Attempt to parse the value as a float64 and assign to the struct
-		// based on the key.
-		switch key {
-		case "voltage_p1":
-			val, err := parseFloat(valueStr)
+		// Attempt to parse different value types
+		if strings.HasPrefix(valueStr, "\"") && strings.HasSuffix(valueStr, "\"") {
+			// Handle strings
+			parsedFields[key] = strings.Trim(valueStr, "\"")
+		} else if strings.EqualFold(valueStr, "true") || strings.EqualFold(valueStr, "false") {
+			// Handle booleans
+			val, err := strconv.ParseBool(valueStr)
 			if err == nil {
-				powerTagData.VoltageP1 = val
+				parsedFields[key] = val
 			}
-		case "current_p1":
-			val, err := parseFloat(valueStr)
+		} else if strings.Contains(valueStr, ".") || strings.Contains(valueStr, "e") || strings.Contains(valueStr, "E") {
+			// Handle floats (contains decimal or exponential)
+			val, err := strconv.ParseFloat(valueStr, 64)
 			if err == nil {
-				powerTagData.CurrentP1 = val
+				parsedFields[key] = val
 			}
-		case "total_power_active":
-			val, err := parseFloat(valueStr)
+		} else if strings.HasSuffix(valueStr, "i") {
+			// Handle integers with 'i' suffix
+			val, err := strconv.ParseInt(strings.TrimSuffix(valueStr, "i"), 10, 64)
 			if err == nil {
-				powerTagData.TotalPowerActive = val
+				parsedFields[key] = val
 			}
-		case "power_p1_active":
-			val, err := parseFloat(valueStr)
+		} else {
+			// Try parsing as integer without suffix
+			val, err := strconv.ParseInt(valueStr, 10, 64)
 			if err == nil {
-				powerTagData.PowerP1Active = val
+				parsedFields[key] = val
+			} else {
+				// If all else fails, treat as string (or handle other types if needed)
+				parsedFields[key] = valueStr
+				fmt.Fprintf(os.Stderr, "%s: warning: could not parse value '%s' for key '%s' as known type, treating as string\n", ProgName, valueStr, key)
 			}
-		case "total_power_apparent":
-			val, err := parseFloat(valueStr)
-			if err == nil {
-				powerTagData.TotalPowerApparent = val
-			}
-		case "freq":
-			val, err := parseFloat(valueStr)
-			if err == nil {
-				powerTagData.Freq = val
-			}
-		case "power_factor":
-			val, err := parseFloat(valueStr)
-			if err == nil {
-				powerTagData.PowerFactor = val
-			}
-			// Add other cases for fields you want to expose via MQTT
 		}
 	}
 
-	// Basic check if any relevant power data was extracted.
-	// This might need adjustment based on your expectations.
-	if powerTagData.VoltageP1 == 0 && powerTagData.CurrentP1 == 0 &&
-		powerTagData.TotalPowerActive == 0 && powerTagData.PowerP1Active == 0 &&
-		powerTagData.TotalPowerApparent == 0 && powerTagData.Freq == 0 &&
-		powerTagData.PowerFactor == 0 {
-		// Depending on your data, you might want a stricter check.
-		// For now, we'll proceed even if no power fields were found in a specific line.
-	}
-
-	return deviceID, powerTagData, nil
+	return deviceID, parsedFields, nil
 }
 
-// parseFloat attempts to parse a string as a float64, handling potential type suffixes.
-func parseFloat(s string) (float64, error) {
-	// Remove potential type suffixes for numeric values
-	s = strings.TrimSuffix(s, "i") // Integer suffix
-	// You might need to handle other suffixes like 't' (boolean) or '"' (string)
-	// if you want to expose those via MQTT, but for power data, float is common.
-
-	return strconv.ParseFloat(s, 64)
+// updateDeviceState updates the fields of a PowerTagState struct
+// with values from a map of parsed fields.
+func updateDeviceState(state *PowerTagState, fields map[string]interface{}) {
+	for key, value := range fields {
+		switch key {
+		case "voltage_p1":
+			if val, ok := value.(float64); ok {
+				state.VoltageP1 = val
+			}
+		case "current_p1":
+			if val, ok := value.(float64); ok {
+				state.CurrentP1 = val
+			}
+		case "total_power_active":
+			if val, ok := value.(float64); ok {
+				state.TotalPowerActive = val
+			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
+				state.TotalPowerActive = float64(val)
+			}
+		case "power_p1_active":
+			if val, ok := value.(float64); ok {
+				state.PowerP1Active = val
+			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
+				state.PowerP1Active = float64(val)
+			}
+		case "total_power_apparent":
+			if val, ok := value.(float64); ok {
+				state.TotalPowerApparent = val
+			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
+				state.TotalPowerApparent = float64(val)
+			}
+		case "freq":
+			if val, ok := value.(float64); ok {
+				state.Freq = val
+			}
+		case "power_factor":
+			if val, ok := value.(float64); ok {
+				state.PowerFactor = val
+			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
+				state.PowerFactor = float64(val)
+			}
+		case "serial":
+			if val, ok := value.(string); ok {
+				state.Serial = val
+			}
+		case "fw_ver":
+			if val, ok := value.(string); ok {
+				state.FwVer = val
+			}
+		case "hw_ver":
+			if val, ok := value.(string); ok {
+				state.HwVer = val
+			}
+			// Add cases for other fields you added to PowerTagState
+		}
+	}
 }
