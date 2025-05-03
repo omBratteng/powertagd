@@ -22,9 +22,10 @@ const HassDiscoveryTopic string = "homeassistant" // Default Home Assistant disc
 
 // Define a struct to hold the state for a PowerTag device, focusing on key metrics
 type PowerTagState struct {
-	Voltage float64 `json:"voltage,omitempty"` // Renamed from VoltageP1
-	Current float64 `json:"current,omitempty"` // Renamed from CurrentP1
-	Power   float64 `json:"power,omitempty"`   // Renamed from TotalPowerActive
+	Voltage  float64   `json:"voltage,omitempty"`   // Renamed from VoltageP1
+	Current  float64   `json:"current,omitempty"`   // Renamed from CurrentP1
+	Power    float64   `json:"power,omitempty"`     // Renamed from TotalPowerActive
+	LastSeen time.Time `json:"last_seen,omitempty"` // Added LastSeen timestamp
 	// Filtered out other fields
 }
 
@@ -38,6 +39,7 @@ type HassMqttSensorConfig struct {
 	StateClass        string              `json:"state_class,omitempty"`
 	UniqueID          string              `json:"unique_id"`
 	Device            *HassMqttDeviceInfo `json:"device,omitempty"`
+	EnabledByDefault  bool                `json:"enabled_by_default"`
 	// Add other sensor configuration options as needed
 }
 
@@ -214,8 +216,9 @@ func main() {
 				// If this is a new device, publish discovery messages
 				publishDiscoveryMessages(mqttClient, deviceID, mqttDiscoveryTopic, mqttTopic)
 			}
-			// Apply the parsed fields to the device's state
+			// Apply the parsed fields to the device's state and update LastSeen
 			updateDeviceState(deviceStates[deviceID], parsedFields)
+			deviceStates[deviceID].LastSeen = time.Now()
 			statesMutex.Unlock() // Unlock after updating
 
 			// Construct the MQTT state topic using the prefix and device ID
@@ -245,18 +248,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s: error reading from stdin: %v\n", ProgName, err)
 		os.Exit(1)
 	}
-
-	// Ensure all buffered InfluxDB points are flushed before exiting
-	// This defer will only be active if influxdbEnabled is true
-	// writeAPI.Flush() // Removed explicit flush, defer handles it
-
-	// Explicitly close InfluxDB client (defer also handles this)
-	// client.Close() // Removed explicit close
-
-	// Disconnect MQTT client if connected (defer handles this too)
-	// if mqttClient != nil && mqttClient.IsConnected() {
-	// 	mqttClient.Disconnect(250)
-	// }
 }
 
 // parseInfluxLineForMQTT attempts to parse an InfluxDB Line Protocol string
@@ -396,10 +387,12 @@ func publishDiscoveryMessages(client mqtt.Client, deviceID string, discoveryTopi
 		deviceClass       string
 		stateClass        string
 		valueTemplate     string
+		enabledByDefault  bool
 	}{
-		{"power", "Power", "W", "power", "measurement", "{{ value_json.power }}"},
-		{"voltage", "Voltage", "V", "voltage", "measurement", "{{ value_json.voltage }}"},
-		{"current", "Current", "A", "current", "measurement", "{{ value_json.current }}"},
+		{"power", "Power", "W", "power", "measurement", "{{ value_json.power }}", true},
+		{"voltage", "Voltage", "V", "voltage", "measurement", "{{ value_json.voltage }}", true},
+		{"current", "Current", "A", "current", "measurement", "{{ value_json.current }}", true},
+		{"last_seen", "Last Seen", "", "timestamp", "", "{{ value_json.last_seen }}", false},
 	}
 
 	for _, sensor := range sensorsToDiscover {
@@ -418,6 +411,7 @@ func publishDiscoveryMessages(client mqtt.Client, deviceID string, discoveryTopi
 			DeviceClass:       sensor.deviceClass,
 			StateClass:        sensor.stateClass,
 			UniqueID:          objectID, // Must be unique across all sensors in HA
+			EnabledByDefault:  sensor.enabledByDefault,
 			Device:            deviceInfo,
 		}
 
