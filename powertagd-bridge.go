@@ -17,7 +17,7 @@ import (
 	"github.com/influxdata/influxdb-client-go/v2/api"
 )
 
-const ProgName string = "powertag2influx"
+const ProgName string = "powertagd-bridge"
 const HassDiscoveryTopic string = "homeassistant" // Default Home Assistant discovery topic
 
 // Define a struct to hold the state for a PowerTag device, focusing on key metrics
@@ -92,20 +92,6 @@ func main() {
 	flag.StringVar(&mqttPassword, "mqtt-password", "", "MQTT password (optional)")
 
 	flag.Parse()
-
-	// InfluxDB argument validation (still required even if connection fails later)
-	if token == "" {
-		fmt.Fprintf(os.Stderr, "%s: --token argument is required\n", ProgName)
-		os.Exit(2)
-	}
-	if orgId == "" {
-		fmt.Fprintf(os.Stderr, "%s: --orgId argument is required\n", ProgName)
-		os.Exit(2)
-	}
-	if bucket == "" {
-		fmt.Fprintf(os.Stderr, "%s: --bucket argument is required\n", ProgName)
-		os.Exit(2)
-	}
 
 	// Standard input check
 	stat, _ := os.Stdin.Stat()

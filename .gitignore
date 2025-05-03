@@ -8,3 +8,4 @@ target
 Cargo.lock
 /powertag2influx
 vendor
+/powertagd-bridge
