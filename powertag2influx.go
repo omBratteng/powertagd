@@ -9,7 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync" // Added for concurrency safety (if needed, though the current loop is sequential)
+	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -17,25 +17,45 @@ import (
 )
 
 const ProgName string = "powertag2influx"
+const HassDiscoveryTopic string = "homeassistant" // Default Home Assistant discovery topic
 
-// Define a struct to hold the full state for a PowerTag device
+// Define a struct to hold the state for a PowerTag device, focusing on key metrics
 type PowerTagState struct {
-	VoltageP1          float64 `json:"voltage_p1,omitempty"`
-	CurrentP1          float64 `json:"current_p1,omitempty"`
-	TotalPowerActive   float64 `json:"total_power_active,omitempty"`
-	PowerP1Active      float64 `json:"power_p1_active,omitempty"`
-	TotalPowerApparent float64 `json:"total_power_apparent,omitempty"`
-	Freq               float64 `json:"freq,omitempty"`
-	PowerFactor        float64 `json:"power_factor,omitempty"`
-	Serial             string  `json:"serial,omitempty"` // Added serial
-	FwVer              string  `json:"fw_ver,omitempty"` // Added firmware version
-	HwVer              string  `json:"hw_ver,omitempty"` // Added hardware version
-	// Add other relevant fields you want to track and send
+	Voltage float64 `json:"voltage,omitempty"` // Renamed from VoltageP1
+	Current float64 `json:"current,omitempty"` // Renamed from CurrentP1
+	Power   float64 `json:"power,omitempty"`   // Renamed from TotalPowerActive
+	// Filtered out other fields
+}
+
+// Define a struct for the Home Assistant MQTT Discovery payload for a sensor
+type HassMqttSensorConfig struct {
+	Name              string              `json:"name"`
+	StateTopic        string              `json:"state_topic"`
+	ValueTemplate     string              `json:"value_template"`
+	UnitOfMeasurement string              `json:"unit_of_measurement,omitempty"`
+	DeviceClass       string              `json:"device_class,omitempty"`
+	StateClass        string              `json:"state_class,omitempty"`
+	UniqueID          string              `json:"unique_id"`
+	Device            *HassMqttDeviceInfo `json:"device,omitempty"`
+	// Add other sensor configuration options as needed
+}
+
+// Define a struct for the Home Assistant MQTT Discovery Device Info
+type HassMqttDeviceInfo struct {
+	Identifiers  []string `json:"identifiers"`
+	Name         string   `json:"name"`
+	Model        string   `json:"model,omitempty"`
+	Manufacturer string   `json:"manufacturer,omitempty"`
+	// sw_version and hw_version can be added if you reliably extract them and want them in HA device info
 }
 
 // Map to hold the current state for each device, keyed by device ID
 var deviceStates map[string]*PowerTagState
-var statesMutex sync.Mutex // Mutex to protect access to deviceStates (good practice)
+var statesMutex sync.Mutex // Mutex to protect access to deviceStates
+
+// Map to track which devices have had their discovery payloads published
+var discoveryPublished map[string]bool
+var discoveryMutex sync.Mutex // Mutex to protect access to discoveryPublished
 
 func main() {
 	var url string
@@ -44,7 +64,8 @@ func main() {
 	var bucket string
 
 	var mqttBroker string
-	var mqttTopicPrefix string // Changed to prefix to allow for device ID in topic
+	var mqttTopic string          // Base topic for state updates (device ID will be appended)
+	var mqttDiscoveryTopic string // Home Assistant discovery topic
 	var mqttClientID string
 	var mqttUsername string
 	var mqttPassword string
@@ -55,7 +76,8 @@ func main() {
 	flag.StringVar(&bucket, "bucket", "", "InfluxDB bucket")
 
 	flag.StringVar(&mqttBroker, "mqtt-broker", "", "MQTT broker URL (e.g., tcp://localhost:1883)")
-	flag.StringVar(&mqttTopicPrefix, "mqtt-topic-prefix", "", "MQTT topic prefix to publish data to (device ID will be appended)")
+	flag.StringVar(&mqttTopic, "mqtt-topic", "powertag", "MQTT base topic for state updates (device ID will be appended)")
+	flag.StringVar(&mqttDiscoveryTopic, "mqtt-discovery-topic", HassDiscoveryTopic, "Home Assistant MQTT discovery topic")
 	flag.StringVar(&mqttClientID, "mqtt-clientid", ProgName, "MQTT client ID")
 	flag.StringVar(&mqttUsername, "mqtt-username", "", "MQTT username (optional)")
 	flag.StringVar(&mqttPassword, "mqtt-password", "", "MQTT password (optional)")
@@ -119,8 +141,8 @@ func main() {
 
 	// --- MQTT Client Setup (if broker is specified) ---
 	var mqttClient mqtt.Client
-	mqttEnabled := false // Flag to track if MQTT is enabled
-	if mqttBroker != "" && mqttTopicPrefix != "" {
+	mqttEnabled := false  // Flag to track if MQTT is enabled
+	if mqttBroker != "" { // Only require broker for MQTT
 		mqttOpts := mqtt.NewClientOptions().AddBroker(mqttBroker).SetClientID(mqttClientID)
 		if mqttUsername != "" {
 			mqttOpts.SetUsername(mqttUsername)
@@ -135,6 +157,9 @@ func main() {
 		mqttOpts.SetConnectRetryInterval(2 * time.Second)
 		mqttOpts.SetAutoReconnect(true)
 
+		// Optional: Set Last Will and Testament (LWT) - informs broker if client disconnects unexpectedly
+		// mqttOpts.SetWill(fmt.Sprintf("%s/status", mqttClientID), "offline", 0, true)
+
 		mqttClient = mqtt.NewClient(mqttOpts)
 		if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
 			fmt.Fprintf(os.Stderr, "%s: failed connecting to MQTT broker at %s: %v\n", ProgName, mqttBroker, token.Error())
@@ -144,13 +169,13 @@ func main() {
 			defer mqttClient.Disconnect(250) // Disconnect gracefully on exit
 			mqttEnabled = true               // Set flag if connected
 		}
-	} else if mqttBroker != "" || mqttTopicPrefix != "" {
-		// Warn if only one of broker or topic prefix is provided
-		fmt.Fprintf(os.Stderr, "%s: warning: both --mqtt-broker and --mqtt-topic-prefix must be specified to enable MQTT\n", ProgName)
+	} else {
+		fmt.Fprintf(os.Stderr, "%s: MQTT broker not specified, MQTT disabled.\n", ProgName)
 	}
 
-	// Initialize the device states map
+	// Initialize the device states map and discovery published map
 	deviceStates = make(map[string]*PowerTagState)
+	discoveryPublished = make(map[string]bool)
 
 	// --- Read from Stdin and Process ---
 	lnscan := bufio.NewScanner(os.Stdin)
@@ -175,13 +200,15 @@ func main() {
 			if _, ok := deviceStates[deviceID]; !ok {
 				// If the device is not in the map, initialize its state
 				deviceStates[deviceID] = &PowerTagState{}
+				// If this is a new device, publish discovery messages
+				publishDiscoveryMessages(mqttClient, deviceID, mqttDiscoveryTopic, mqttTopic)
 			}
 			// Apply the parsed fields to the device's state
 			updateDeviceState(deviceStates[deviceID], parsedFields)
 			statesMutex.Unlock() // Unlock after updating
 
-			// Construct the MQTT topic using the prefix and device ID
-			mqttTopic := fmt.Sprintf("%s/%s/state", strings.TrimSuffix(mqttTopicPrefix, "/"), deviceID)
+			// Construct the MQTT state topic using the prefix and device ID
+			mqttStateTopic := fmt.Sprintf("%s/%s/state", strings.TrimSuffix(mqttTopic, "/"), deviceID)
 
 			// Marshal the *full* current state into JSON
 			statesMutex.Lock() // Lock while accessing the state for marshaling
@@ -194,11 +221,11 @@ func main() {
 				continue
 			}
 
-			// Publish the JSON to MQTT
-			token := mqttClient.Publish(mqttTopic, 0, false, jsonData) // QoS 0, not retained
+			// Publish the JSON state to MQTT
+			token := mqttClient.Publish(mqttStateTopic, 0, false, jsonData) // QoS 0, not retained
 			token.Wait()
 			if token.Error() != nil {
-				fmt.Fprintf(os.Stderr, "%s: mqtt publish error for device %s: %v\n", ProgName, deviceID, token.Error())
+				fmt.Fprintf(os.Stderr, "%s: mqtt publish state error for device %s: %v\n", ProgName, deviceID, token.Error())
 			}
 		}
 	}
@@ -220,7 +247,7 @@ func main() {
 
 // parseInfluxLineForMQTT attempts to parse an InfluxDB Line Protocol string
 // and extract the device ID and a map of the fields.
-// It returns the device ID, a map of field key-value pairs, and an error.
+// It returns the device ID, a map of field key-value pairs for the *relevant* fields, and an error.
 func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error) {
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
@@ -233,7 +260,7 @@ func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error)
 
 	deviceID := ""
 	// Iterate over tags to find the device ID
-	for _, tag := range tagSet[1:] { // Skip the measurement
+	for _, tag := range tagSet { // Iterate over all tags including the first one
 		tagParts := strings.SplitN(tag, "=", 2)
 		if len(tagParts) == 2 {
 			if tagParts[0] == "id" {
@@ -251,47 +278,53 @@ func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error)
 	fieldsStr := parts[1]
 	fieldPairs := strings.Split(fieldsStr, ",")
 
+	// Only parse the fields we are interested in for MQTT
 	parsedFields := make(map[string]interface{})
+	relevantFields := map[string]string{
+		"total_power_active": "power",
+		"voltage_p1":         "voltage",
+		"current_p1":         "current",
+	}
 
 	for _, pair := range fieldPairs {
 		keyValue := strings.SplitN(pair, "=", 2)
 		if len(keyValue) != 2 {
 			continue // Skip invalid key=value pairs
 		}
-		key := keyValue[0]
+		influxKey := keyValue[0]
 		valueStr := keyValue[1]
 
-		// Attempt to parse different value types
-		if strings.HasPrefix(valueStr, "\"") && strings.HasSuffix(valueStr, "\"") {
-			// Handle strings
-			parsedFields[key] = strings.Trim(valueStr, "\"")
-		} else if strings.EqualFold(valueStr, "true") || strings.EqualFold(valueStr, "false") {
-			// Handle booleans
-			val, err := strconv.ParseBool(valueStr)
-			if err == nil {
-				parsedFields[key] = val
-			}
-		} else if strings.Contains(valueStr, ".") || strings.Contains(valueStr, "e") || strings.Contains(valueStr, "E") {
-			// Handle floats (contains decimal or exponential)
+		// Check if this is a relevant field
+		mqttKey, isRelevant := relevantFields[influxKey]
+		if !isRelevant {
+			continue // Skip fields we are not interested in for MQTT
+		}
+
+		// Attempt to parse different value types for the relevant field
+		if strings.Contains(valueStr, ".") || strings.Contains(valueStr, "e") || strings.Contains(valueStr, "E") {
+			// Handle floats
 			val, err := strconv.ParseFloat(valueStr, 64)
 			if err == nil {
-				parsedFields[key] = val
+				parsedFields[mqttKey] = val // Use the desired MQTT key
+			} else {
+				fmt.Fprintf(os.Stderr, "%s: warning: failed to parse relevant float value '%s' for key '%s': %v\n", ProgName, valueStr, influxKey, err)
 			}
 		} else if strings.HasSuffix(valueStr, "i") {
 			// Handle integers with 'i' suffix
 			val, err := strconv.ParseInt(strings.TrimSuffix(valueStr, "i"), 10, 64)
 			if err == nil {
-				parsedFields[key] = val
+				parsedFields[mqttKey] = float64(val) // Convert integers to float64 for consistency in the struct
+			} else {
+				fmt.Fprintf(os.Stderr, "%s: warning: failed to parse relevant integer value '%s' for key '%s': %v\n", ProgName, valueStr, influxKey, err)
 			}
 		} else {
 			// Try parsing as integer without suffix
 			val, err := strconv.ParseInt(valueStr, 10, 64)
 			if err == nil {
-				parsedFields[key] = val
+				parsedFields[mqttKey] = float64(val) // Convert integers to float64
 			} else {
-				// If all else fails, treat as string (or handle other types if needed)
-				parsedFields[key] = valueStr
-				fmt.Fprintf(os.Stderr, "%s: warning: could not parse value '%s' for key '%s' as known type, treating as string\n", ProgName, valueStr, key)
+				// This shouldn't happen for the targeted fields if they are always numeric
+				fmt.Fprintf(os.Stderr, "%s: warning: failed to parse relevant numeric value '%s' for key '%s': %v\n", ProgName, valueStr, influxKey, err)
 			}
 		}
 	}
@@ -300,59 +333,100 @@ func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error)
 }
 
 // updateDeviceState updates the fields of a PowerTagState struct
-// with values from a map of parsed fields.
+// with values from a map of parsed fields (which now only contains relevant fields).
 func updateDeviceState(state *PowerTagState, fields map[string]interface{}) {
 	for key, value := range fields {
 		switch key {
-		case "voltage_p1":
+		case "voltage":
 			if val, ok := value.(float64); ok {
-				state.VoltageP1 = val
+				state.Voltage = val
 			}
-		case "current_p1":
+		case "current":
 			if val, ok := value.(float64); ok {
-				state.CurrentP1 = val
+				state.Current = val
 			}
-		case "total_power_active":
+		case "power":
 			if val, ok := value.(float64); ok {
-				state.TotalPowerActive = val
-			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
-				state.TotalPowerActive = float64(val)
+				state.Power = val
 			}
-		case "power_p1_active":
-			if val, ok := value.(float64); ok {
-				state.PowerP1Active = val
-			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
-				state.PowerP1Active = float64(val)
-			}
-		case "total_power_apparent":
-			if val, ok := value.(float64); ok {
-				state.TotalPowerApparent = val
-			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
-				state.TotalPowerApparent = float64(val)
-			}
-		case "freq":
-			if val, ok := value.(float64); ok {
-				state.Freq = val
-			}
-		case "power_factor":
-			if val, ok := value.(float64); ok {
-				state.PowerFactor = val
-			} else if val, ok := value.(int64); ok { // Handle potential integer parsing
-				state.PowerFactor = float64(val)
-			}
-		case "serial":
-			if val, ok := value.(string); ok {
-				state.Serial = val
-			}
-		case "fw_ver":
-			if val, ok := value.(string); ok {
-				state.FwVer = val
-			}
-		case "hw_ver":
-			if val, ok := value.(string); ok {
-				state.HwVer = val
-			}
-			// Add cases for other fields you added to PowerTagState
+			// No cases for other fields, as they are filtered out earlier
 		}
 	}
+}
+
+// publishDiscoveryMessages publishes Home Assistant MQTT discovery messages for a device.
+func publishDiscoveryMessages(client mqtt.Client, deviceID string, discoveryTopicPrefix string, stateTopicPrefix string) {
+	discoveryMutex.Lock()
+	if discoveryPublished[deviceID] {
+		discoveryMutex.Unlock()
+		return // Discovery messages already published for this device
+	}
+	discoveryMutex.Unlock()
+
+	// Base device information for Home Assistant
+	deviceInfo := &HassMqttDeviceInfo{
+		Identifiers:  []string{fmt.Sprintf("powertag_%s", deviceID)},
+		Name:         fmt.Sprintf("PowerTag %s", deviceID),
+		Model:        "PowerTag",           // You might be able to extract a more specific model if available
+		Manufacturer: "Schneider Electric", // Assuming Schneider Electric based on PowerTag name
+	}
+
+	// Construct the base state topic for this device
+	mqttStateTopic := fmt.Sprintf("%s/%s/state", strings.TrimSuffix(stateTopicPrefix, "/"), deviceID)
+
+	// Define the sensors to publish via discovery (only the ones we are interested in)
+	sensorsToDiscover := []struct {
+		mqttFieldName     string // The key name in the MQTT JSON payload
+		name              string
+		unitOfMeasurement string
+		deviceClass       string
+		stateClass        string
+		valueTemplate     string
+	}{
+		{"power", "Power", "W", "power", "measurement", "{{ value_json.power }}"},
+		{"voltage", "Voltage", "V", "voltage", "measurement", "{{ value_json.voltage }}"},
+		{"current", "Current", "A", "current", "measurement", "{{ value_json.current }}"},
+	}
+
+	for _, sensor := range sensorsToDiscover {
+		// Construct the unique object ID for the sensor
+		objectID := fmt.Sprintf("%s_%s", deviceID, sensor.mqttFieldName) // e.g., 0xe2063d31_power
+
+		// Construct the discovery topic for this specific sensor
+		discoveryTopic := fmt.Sprintf("%s/sensor/%s/%s/config", strings.TrimSuffix(discoveryTopicPrefix, "/"), deviceID, objectID)
+
+		// Create the discovery payload
+		configPayload := HassMqttSensorConfig{
+			Name:              sensor.name,
+			StateTopic:        mqttStateTopic,
+			ValueTemplate:     sensor.valueTemplate,
+			UnitOfMeasurement: sensor.unitOfMeasurement,
+			DeviceClass:       sensor.deviceClass,
+			StateClass:        sensor.stateClass,
+			UniqueID:          objectID, // Must be unique across all sensors in HA
+			Device:            deviceInfo,
+		}
+
+		// Marshal the configuration payload to JSON
+		payloadJSON, marshalErr := json.Marshal(configPayload)
+		if marshalErr != nil {
+			fmt.Fprintf(os.Stderr, "%s: failed to marshal discovery payload for device %s sensor %s: %v\n", ProgName, deviceID, sensor.name, marshalErr)
+			continue // Skip publishing this sensor's discovery message
+		}
+
+		// Publish the discovery message with retain flag set
+		token := client.Publish(discoveryTopic, 0, true, payloadJSON) // QoS 0, Retained = true
+		token.Wait()
+		if token.Error() != nil {
+			fmt.Fprintf(os.Stderr, "%s: mqtt publish discovery error for device %s sensor %s: %v\n", ProgName, deviceID, sensor.name, token.Error())
+		} else {
+			// Removed verbose discovery publish log
+			// fmt.Printf("%s: published discovery message for device %s sensor %s to topic: %s\n", ProgName, deviceID, sensor.name, discoveryTopic)
+		}
+	}
+
+	// Mark discovery as published for this device
+	discoveryMutex.Lock()
+	discoveryPublished[deviceID] = true
+	discoveryMutex.Unlock()
 }
