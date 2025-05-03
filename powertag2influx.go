@@ -57,7 +57,14 @@ var statesMutex sync.Mutex // Mutex to protect access to deviceStates
 var discoveryPublished map[string]bool
 var discoveryMutex sync.Mutex // Mutex to protect access to discoveryPublished
 
+var debugEnabled bool // Flag to control debug output
+
 func main() {
+	// Check for DEBUG environment variable
+	if os.Getenv("DEBUG") == "true" {
+		debugEnabled = true
+	}
+
 	var url string
 	var token string
 	var orgId string
@@ -181,6 +188,11 @@ func main() {
 	lnscan := bufio.NewScanner(os.Stdin)
 	for lnscan.Scan() {
 		line := lnscan.Text()
+
+		// Debug print the input line if debug is enabled
+		if debugEnabled {
+			fmt.Fprintf(os.Stderr, "%s: DEBUG: Received line: %s\n", ProgName, line)
+		}
 
 		// Write to InfluxDB
 		writeAPI.WriteRecord(line)
