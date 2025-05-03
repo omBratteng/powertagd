@@ -14,6 +14,7 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api"
 )
 
 const ProgName string = "powertag2influx"
@@ -57,7 +58,8 @@ var statesMutex sync.Mutex // Mutex to protect access to deviceStates
 var discoveryPublished map[string]bool
 var discoveryMutex sync.Mutex // Mutex to protect access to discoveryPublished
 
-var debugEnabled bool // Flag to control debug output
+var debugEnabled bool    // Flag to control debug output
+var influxdbEnabled bool // Flag to track if InfluxDB is enabled and connected
 
 func main() {
 	// Check for DEBUG environment variable
@@ -91,7 +93,7 @@ func main() {
 
 	flag.Parse()
 
-	// InfluxDB argument validation
+	// InfluxDB argument validation (still required even if connection fails later)
 	if token == "" {
 		fmt.Fprintf(os.Stderr, "%s: --token argument is required\n", ProgName)
 		os.Exit(2)
@@ -123,28 +125,33 @@ func main() {
 	opts.SetBatchSize(10)
 
 	client := influxdb2.NewClientWithOptions(url, token, opts)
-	defer client.Close()
+	defer client.Close() // Defer closing regardless of connection success
 
 	health, err := client.Health(context.Background())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", ProgName, err)
-		fmt.Fprintf(os.Stderr, "%s: failed connecting to InfluxDB server", ProgName)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "%s: failed connecting to InfluxDB server. InfluxDB writes will be disabled.\n", ProgName)
+		influxdbEnabled = false // Set flag to false
+	} else {
+		fmt.Printf("%s: connected to InfluxDB at %s (%s %s)\n", ProgName, url, health.Name, *health.Version)
+		influxdbEnabled = true // Set flag to true on successful connection
 	}
 
-	fmt.Printf("%s: connected to InfluxDB at %s (%s %s)\n", ProgName, url, health.Name, *health.Version)
+	// Only get WriteAPI and error channel if InfluxDB is enabled
+	var writeAPI api.WriteAPI
+	if influxdbEnabled {
+		writeAPI = client.WriteAPI(orgId, bucket)
+		defer writeAPI.Flush()
 
-	writeAPI := client.WriteAPI(orgId, bucket)
-	defer writeAPI.Flush()
-
-	// Get errors channel for InfluxDB writes
-	errorsCh := writeAPI.Errors()
-	// Create go proc for reading and logging InfluxDB errors
-	go func() {
-		for err := range errorsCh {
-			fmt.Fprintf(os.Stderr, "%s: influxdb write error: %s\n", ProgName, err.Error())
-		}
-	}()
+		// Get errors channel for InfluxDB writes
+		errorsCh := writeAPI.Errors()
+		// Create go proc for reading and logging InfluxDB errors
+		go func() {
+			for err := range errorsCh {
+				fmt.Fprintf(os.Stderr, "%s: influxdb write error: %s\n", ProgName, err.Error())
+			}
+		}()
+	}
 
 	// --- MQTT Client Setup (if broker is specified) ---
 	var mqttClient mqtt.Client
@@ -170,7 +177,7 @@ func main() {
 		mqttClient = mqtt.NewClient(mqttOpts)
 		if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
 			fmt.Fprintf(os.Stderr, "%s: failed connecting to MQTT broker at %s: %v\n", ProgName, mqttBroker, token.Error())
-			// We won't exit here, the program can still write to InfluxDB
+			// We won't exit here, the program can still write to InfluxDB if enabled
 		} else if token.Error() == nil {
 			fmt.Printf("%s: connected to MQTT broker at %s\n", ProgName, mqttBroker)
 			defer mqttClient.Disconnect(250) // Disconnect gracefully on exit
@@ -194,8 +201,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "%s: DEBUG: Received line: %s\n", ProgName, line)
 		}
 
-		// Write to InfluxDB
-		writeAPI.WriteRecord(line)
+		// Write to InfluxDB only if it's enabled and the WriteAPI is initialized
+		if influxdbEnabled && writeAPI != nil {
+			writeAPI.WriteRecord(line)
+		} else if influxdbEnabled && writeAPI == nil {
+			// This case should ideally not happen if influxdbEnabled is true,
+			// but as a safety net, we'll log it if WriteAPI is somehow nil.
+			fmt.Fprintf(os.Stderr, "%s: warning: InfluxDB enabled but WriteAPI is nil. Skipping write.\n", ProgName)
+		}
 
 		// Process for MQTT if enabled and client is connected
 		if mqttEnabled && mqttClient.IsConnected() {
@@ -248,13 +261,16 @@ func main() {
 	}
 
 	// Ensure all buffered InfluxDB points are flushed before exiting
-	writeAPI.Flush()
-	client.Close() // Explicitly close client for InfluxDB
+	// This defer will only be active if influxdbEnabled is true
+	// writeAPI.Flush() // Removed explicit flush, defer handles it
 
-	// Disconnect MQTT client if connected (defer handles this too, but explicit is fine)
-	if mqttClient != nil && mqttClient.IsConnected() {
-		mqttClient.Disconnect(250)
-	}
+	// Explicitly close InfluxDB client (defer also handles this)
+	// client.Close() // Removed explicit close
+
+	// Disconnect MQTT client if connected (defer handles this too)
+	// if mqttClient != nil && mqttClient.IsConnected() {
+	// 	mqttClient.Disconnect(250)
+	// }
 }
 
 // parseInfluxLineForMQTT attempts to parse an InfluxDB Line Protocol string
