@@ -24,6 +24,9 @@ RUN go build -ldflags="-s -w" -o /src/powertagd-bridge /src/powertagd-bridge.go
 
 FROM debian:bookworm-slim
 
+LABEL org.opencontainers.image.source="https://github.com/omBratteng/powertagd"
+LABEL org.opencontainers.image.url="https://github.com/omBratteng/powertagd"
+
 COPY --from=builder /powertagd/src/powertagd /powertagd
 COPY --from=bridge-build /src/powertagd-bridge /powertagd-bridge
 COPY run.sh /run.sh
