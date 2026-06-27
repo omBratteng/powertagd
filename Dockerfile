@@ -2,16 +2,16 @@ FROM debian:bookworm-slim AS builder
 WORKDIR /powertagd/src
 
 RUN apt-get update \
-  && apt-get install --no-install-recommends --no-install-suggests -y \
-    ca-certificates \
-    build-essential
+	&& apt-get install --no-install-recommends --no-install-suggests -y \
+	ca-certificates \
+	build-essential
 
 WORKDIR /powertagd/src
 
 COPY src /powertagd/src
 
 RUN set -xe \
-  && make
+	&& make
 
 FROM golang:1.24 AS bridge-build
 WORKDIR /src
