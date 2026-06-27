@@ -25,7 +25,7 @@ type PowerTagState struct {
 	Voltage  float64   `json:"voltage,omitempty"`   // Renamed from VoltageP1
 	Current  float64   `json:"current,omitempty"`   // Renamed from CurrentP1
 	Power    float64   `json:"power,omitempty"`     // Renamed from TotalPowerActive
-	LastSeen time.Time `json:"last_seen,omitempty"` // Added LastSeen timestamp
+	LastSeen time.Time `json:"last_seen"` // Added LastSeen timestamp
 	// Filtered out other fields
 }
 
@@ -71,7 +71,7 @@ func main() {
 
 	var url string
 	var token string
-	var orgId string
+	var orgID string
 	var bucket string
 
 	var mqttBroker string
@@ -83,7 +83,7 @@ func main() {
 
 	flag.StringVar(&url, "url", "http://localhost:8086", "InfluxDB server URL")
 	flag.StringVar(&token, "token", "", "InfluxDB auth token")
-	flag.StringVar(&orgId, "orgId", "", "InfluxDB organization ID")
+	flag.StringVar(&orgID, "orgId", "", "InfluxDB organization ID")
 	flag.StringVar(&bucket, "bucket", "", "InfluxDB bucket")
 
 	flag.StringVar(&mqttBroker, "mqtt-broker", "", "MQTT broker URL (e.g., tcp://localhost:1883)")
@@ -128,7 +128,7 @@ func main() {
 	// Only get WriteAPI and error channel if InfluxDB is enabled
 	var writeAPI api.WriteAPI
 	if influxdbEnabled {
-		writeAPI = client.WriteAPI(orgId, bucket)
+		writeAPI = client.WriteAPI(orgID, bucket)
 		defer writeAPI.Flush()
 
 		// Get errors channel for InfluxDB writes
@@ -253,7 +253,7 @@ func main() {
 // parseInfluxLineForMQTT attempts to parse an InfluxDB Line Protocol string
 // and extract the device ID and a map of the fields.
 // It returns the device ID, a map of field key-value pairs for the *relevant* fields, and an error.
-func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error) {
+func parseInfluxLineForMQTT(line string) (string, map[string]any, error) {
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
 		return "", nil, fmt.Errorf("invalid influxdb line protocol: not enough parts")
@@ -284,7 +284,7 @@ func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error)
 	fieldPairs := strings.Split(fieldsStr, ",")
 
 	// Only parse the fields we are interested in for MQTT
-	parsedFields := make(map[string]interface{})
+	parsedFields := make(map[string]any)
 	relevantFields := map[string]string{
 		"total_power_active": "power",
 		"voltage_p1":         "voltage",
@@ -314,9 +314,9 @@ func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error)
 			} else {
 				fmt.Fprintf(os.Stderr, "%s: warning: failed to parse relevant float value '%s' for key '%s': %v\n", ProgName, valueStr, influxKey, err)
 			}
-		} else if strings.HasSuffix(valueStr, "i") {
+		} else if before, ok :=strings.CutSuffix(valueStr, "i"); ok  {
 			// Handle integers with 'i' suffix
-			val, err := strconv.ParseInt(strings.TrimSuffix(valueStr, "i"), 10, 64)
+			val, err := strconv.ParseInt(before, 10, 64)
 			if err == nil {
 				parsedFields[mqttKey] = float64(val) // Convert integers to float64 for consistency in the struct
 			} else {
@@ -339,7 +339,7 @@ func parseInfluxLineForMQTT(line string) (string, map[string]interface{}, error)
 
 // updateDeviceState updates the fields of a PowerTagState struct
 // with values from a map of parsed fields (which now only contains relevant fields).
-func updateDeviceState(state *PowerTagState, fields map[string]interface{}) {
+func updateDeviceState(state *PowerTagState, fields map[string]any) {
 	for key, value := range fields {
 		switch key {
 		case "voltage":
