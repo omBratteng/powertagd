@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,19 +12,19 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
-	"github.com/influxdata/influxdb-client-go/v2/api"
 )
 
-const ProgName string = "powertagd-bridge"
-const HassDiscoveryTopic string = "homeassistant" // Default Home Assistant discovery topic
+const (
+	ProgName           string = "powertagd-bridge"
+	HassDiscoveryTopic string = "homeassistant" // Default Home Assistant discovery topic
+)
 
 // Define a struct to hold the state for a PowerTag device, focusing on key metrics
 type PowerTagState struct {
-	Voltage  float64   `json:"voltage,omitempty"`   // Renamed from VoltageP1
-	Current  float64   `json:"current,omitempty"`   // Renamed from CurrentP1
-	Power    float64   `json:"power,omitempty"`     // Renamed from TotalPowerActive
-	LastSeen time.Time `json:"last_seen"` // Added LastSeen timestamp
+	Voltage  float64   `json:"voltage,omitempty"` // Renamed from VoltageP1
+	Current  float64   `json:"current,omitempty"` // Renamed from CurrentP1
+	Power    float64   `json:"power,omitempty"`   // Renamed from TotalPowerActive
+	LastSeen time.Time `json:"last_seen"`         // Added LastSeen timestamp
 	// Filtered out other fields
 }
 
@@ -53,15 +52,18 @@ type HassMqttDeviceInfo struct {
 }
 
 // Map to hold the current state for each device, keyed by device ID
-var deviceStates map[string]*PowerTagState
-var statesMutex sync.Mutex // Mutex to protect access to deviceStates
+var (
+	deviceStates map[string]*PowerTagState
+	statesMutex  sync.Mutex // Mutex to protect access to deviceStates
+)
 
 // Map to track which devices have had their discovery payloads published
-var discoveryPublished map[string]bool
-var discoveryMutex sync.Mutex // Mutex to protect access to discoveryPublished
+var (
+	discoveryPublished map[string]bool
+	discoveryMutex     sync.Mutex // Mutex to protect access to discoveryPublished
+)
 
-var debugEnabled bool    // Flag to control debug output
-var influxdbEnabled bool // Flag to track if InfluxDB is enabled and connected
+var debugEnabled bool // Flag to control debug output
 
 func main() {
 	// Check for DEBUG environment variable
@@ -69,22 +71,12 @@ func main() {
 		debugEnabled = true
 	}
 
-	var url string
-	var token string
-	var orgID string
-	var bucket string
-
 	var mqttBroker string
 	var mqttTopic string          // Base topic for state updates (device ID will be appended)
 	var mqttDiscoveryTopic string // Home Assistant discovery topic
 	var mqttClientID string
 	var mqttUsername string
 	var mqttPassword string
-
-	flag.StringVar(&url, "url", "http://localhost:8086", "InfluxDB server URL")
-	flag.StringVar(&token, "token", "", "InfluxDB auth token")
-	flag.StringVar(&orgID, "orgId", "", "InfluxDB organization ID")
-	flag.StringVar(&bucket, "bucket", "", "InfluxDB bucket")
 
 	flag.StringVar(&mqttBroker, "mqtt-broker", "", "MQTT broker URL (e.g., tcp://localhost:1883)")
 	flag.StringVar(&mqttTopic, "mqtt-topic", "powertag", "MQTT base topic for state updates (device ID will be appended)")
@@ -100,84 +92,97 @@ func main() {
 	if stat.Mode()&os.ModeCharDevice != 0 {
 		fmt.Fprintf(os.Stderr, "%s: no data on stdin\n", ProgName)
 		fmt.Fprintf(os.Stderr, "%s expects data to be piped to stdin, i.e.:\n", ProgName)
-		fmt.Fprintf(os.Stderr, "    powertagd | powertag2influx\n")
+		fmt.Fprintf(os.Stderr, "    powertagd | %s\n", ProgName)
 		os.Exit(2)
 	}
 
-	// --- InfluxDB Client Setup ---
-	opts := influxdb2.DefaultOptions()
-	opts.SetApplicationName(ProgName)
-	opts.SetLogLevel(1) // warn
-	opts.SetPrecision(time.Second)
-	opts.SetFlushInterval(1000 * 30) // 30s
-	opts.SetBatchSize(10)
-
-	client := influxdb2.NewClientWithOptions(url, token, opts)
-	defer client.Close() // Defer closing regardless of connection success
-
-	health, err := client.Health(context.Background())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", ProgName, err)
-		fmt.Fprintf(os.Stderr, "%s: failed connecting to InfluxDB server. InfluxDB writes will be disabled.\n", ProgName)
-		influxdbEnabled = false // Set flag to false
-	} else {
-		fmt.Printf("%s: connected to InfluxDB at %s (%s %s)\n", ProgName, url, health.Name, *health.Version)
-		influxdbEnabled = true // Set flag to true on successful connection
-	}
-
-	// Only get WriteAPI and error channel if InfluxDB is enabled
-	var writeAPI api.WriteAPI
-	if influxdbEnabled {
-		writeAPI = client.WriteAPI(orgID, bucket)
-		defer writeAPI.Flush()
-
-		// Get errors channel for InfluxDB writes
-		errorsCh := writeAPI.Errors()
-		// Create go proc for reading and logging InfluxDB errors
-		go func() {
-			for err := range errorsCh {
-				fmt.Fprintf(os.Stderr, "%s: influxdb write error: %s\n", ProgName, err.Error())
-			}
-		}()
-	}
-
-	// --- MQTT Client Setup (if broker is specified) ---
-	var mqttClient mqtt.Client
-	mqttEnabled := false  // Flag to track if MQTT is enabled
-	if mqttBroker != "" { // Only require broker for MQTT
-		mqttOpts := mqtt.NewClientOptions().AddBroker(mqttBroker).SetClientID(mqttClientID)
-		if mqttUsername != "" {
-			mqttOpts.SetUsername(mqttUsername)
-		}
-		if mqttPassword != "" {
-			mqttOpts.SetPassword(mqttPassword)
-		}
-
-		// Set a reasonable reconnect interval
-		mqttOpts.SetKeepAlive(60 * time.Second)
-		mqttOpts.SetPingTimeout(1 * time.Second)
-		mqttOpts.SetConnectRetryInterval(2 * time.Second)
-		mqttOpts.SetAutoReconnect(true)
-
-		// Optional: Set Last Will and Testament (LWT) - informs broker if client disconnects unexpectedly
-		// mqttOpts.SetWill(fmt.Sprintf("%s/status", mqttClientID), "offline", 0, true)
-
-		mqttClient = mqtt.NewClient(mqttOpts)
-		if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
-			fmt.Fprintf(os.Stderr, "%s: failed connecting to MQTT broker at %s: %v\n", ProgName, mqttBroker, token.Error())
-			// We won't exit here, the program can still write to InfluxDB if enabled
-		} else if token.Error() == nil {
-			fmt.Printf("%s: connected to MQTT broker at %s\n", ProgName, mqttBroker)
-			defer mqttClient.Disconnect(250) // Disconnect gracefully on exit
-			mqttEnabled = true               // Set flag if connected
-		}
-	} else {
-		fmt.Fprintf(os.Stderr, "%s: MQTT broker not specified, MQTT disabled.\n", ProgName)
+	// MQTT is the only output, so a broker is required.
+	if mqttBroker == "" {
+		fmt.Fprintf(os.Stderr, "%s: -mqtt-broker is required (e.g. tcp://localhost:1883)\n", ProgName)
+		os.Exit(2)
 	}
 
 	// Initialize the device states map and discovery published map
 	deviceStates = make(map[string]*PowerTagState)
 	discoveryPublished = make(map[string]bool)
+
+	// --- MQTT Client Setup ---
+	statusTopic := fmt.Sprintf("%s/status", strings.TrimSuffix(mqttTopic, "/"))
+
+	mqttOpts := mqtt.NewClientOptions().AddBroker(mqttBroker).SetClientID(mqttClientID)
+	if mqttUsername != "" {
+		mqttOpts.SetUsername(mqttUsername)
+	}
+	if mqttPassword != "" {
+		mqttOpts.SetPassword(mqttPassword)
+	}
+
+	// Connection tuning for robust automatic reconnects.
+	mqttOpts.SetKeepAlive(60 * time.Second)
+	mqttOpts.SetPingTimeout(5 * time.Second)
+	mqttOpts.SetConnectTimeout(10 * time.Second)
+	mqttOpts.SetAutoReconnect(true)
+	mqttOpts.SetConnectRetryInterval(2 * time.Second)
+	mqttOpts.SetMaxReconnectInterval(30 * time.Second)
+	// Retry the initial connect too, so startup succeeds even if the broker
+	// is not yet reachable.
+	mqttOpts.SetConnectRetry(true)
+	// Resume the same session across reconnects so subscriptions/state persist.
+	mqttOpts.SetCleanSession(false)
+
+	// Last Will and Testament: broker publishes "offline" if we drop unexpectedly.
+	mqttOpts.SetWill(statusTopic, "offline", 1, true)
+
+	// OnConnect fires on both the first connect and every successful reconnect.
+	mqttOpts.SetOnConnectHandler(func(c mqtt.Client) {
+		fmt.Printf("%s: connected to MQTT broker at %s\n", ProgName, mqttBroker)
+
+		// Announce availability (retained).
+		if token := c.Publish(statusTopic, 1, true, "online"); token.WaitTimeout(5*time.Second) && token.Error() != nil {
+			fmt.Fprintf(os.Stderr, "%s: mqtt publish status error: %v\n", ProgName, token.Error())
+		}
+
+		// Re-publish Home Assistant discovery after a (re)connect. The broker
+		// may have restarted and lost retained discovery messages, so reset the
+		// tracking map and re-announce every device we already know about.
+		discoveryMutex.Lock()
+		discoveryPublished = make(map[string]bool)
+		discoveryMutex.Unlock()
+
+		statesMutex.Lock()
+		knownDevices := make([]string, 0, len(deviceStates))
+		for id := range deviceStates {
+			knownDevices = append(knownDevices, id)
+		}
+		statesMutex.Unlock()
+
+		for _, id := range knownDevices {
+			publishDiscoveryMessages(c, id, mqttDiscoveryTopic, mqttTopic)
+		}
+	})
+
+	mqttOpts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
+		fmt.Fprintf(os.Stderr, "%s: mqtt connection lost: %v (auto-reconnecting)\n", ProgName, err)
+	})
+
+	mqttOpts.SetReconnectingHandler(func(c mqtt.Client, o *mqtt.ClientOptions) {
+		fmt.Fprintf(os.Stderr, "%s: attempting to reconnect to MQTT broker at %s...\n", ProgName, mqttBroker)
+	})
+
+	mqttClient := mqtt.NewClient(mqttOpts)
+	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		// With SetConnectRetry(true) the client keeps retrying in the
+		// background, so we only warn here rather than exit.
+		fmt.Fprintf(os.Stderr, "%s: initial MQTT connect to %s failed: %v (will keep retrying)\n", ProgName, mqttBroker, token.Error())
+	}
+	defer func() {
+		// Mark offline and disconnect gracefully on exit.
+		if mqttClient.IsConnected() {
+			t := mqttClient.Publish(statusTopic, 1, true, "offline")
+			t.WaitTimeout(2 * time.Second)
+		}
+		mqttClient.Disconnect(250)
+	}()
 
 	// --- Read from Stdin and Process ---
 	lnscan := bufio.NewScanner(os.Stdin)
@@ -189,17 +194,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "%s: DEBUG: Received line: %s\n", ProgName, line)
 		}
 
-		// Write to InfluxDB only if it's enabled and the WriteAPI is initialized
-		if influxdbEnabled && writeAPI != nil {
-			writeAPI.WriteRecord(line)
-		} else if influxdbEnabled && writeAPI == nil {
-			// This case should ideally not happen if influxdbEnabled is true,
-			// but as a safety net, we'll log it if WriteAPI is somehow nil.
-			fmt.Fprintf(os.Stderr, "%s: warning: InfluxDB enabled but WriteAPI is nil. Skipping write.\n", ProgName)
-		}
-
-		// Process for MQTT if enabled and client is connected
-		if mqttEnabled && mqttClient.IsConnected() {
+		// Only process/publish while connected. Auto-reconnect handles
+		// transient outages; QoS 0 state messages during a disconnect would
+		// be dropped anyway, so skip them.
+		if mqttClient.IsConnected() {
 			// Attempt to parse the InfluxDB line protocol for MQTT
 			deviceID, parsedFields, parseErr := parseInfluxLineForMQTT(line)
 			if parseErr != nil {
@@ -314,7 +312,7 @@ func parseInfluxLineForMQTT(line string) (string, map[string]any, error) {
 			} else {
 				fmt.Fprintf(os.Stderr, "%s: warning: failed to parse relevant float value '%s' for key '%s': %v\n", ProgName, valueStr, influxKey, err)
 			}
-		} else if before, ok :=strings.CutSuffix(valueStr, "i"); ok  {
+		} else if before, ok := strings.CutSuffix(valueStr, "i"); ok {
 			// Handle integers with 'i' suffix
 			val, err := strconv.ParseInt(before, 10, 64)
 			if err == nil {

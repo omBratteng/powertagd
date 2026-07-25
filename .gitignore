@@ -6,6 +6,5 @@ src/powertagctl
 src/test_crypto
 target
 Cargo.lock
-/powertag2influx
 vendor
 /powertagd-bridge
