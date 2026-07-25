@@ -84,18 +84,24 @@ Finally run `powertagd -d /dev/xxx` to start processing the PowerTags readings.
 - power_factor: -100% to +100%
 - energy: kWh
 
+## MQTT / Home Assistant
+
+`powertagd` prints each measurement to `stdout` in InfluxDB Line Protocol
+format. Pipe this output into `powertagd-bridge` to parse the readings and
+publish them over MQTT, including Home Assistant MQTT discovery:
+```
+powertagd -d /dev/xxx | powertagd-bridge \
+  --mqtt-broker tcp://127.0.0.1:1883 \
+  --mqtt-topic powertag
+```
+
+The bridge automatically reconnects to the broker and re-publishes Home
+Assistant discovery messages after a reconnect. See `run.sh` for a full example.
+
 ## InfluxDB
 
-`powertagd` has built-in support to send metrics directly to InfluxDB:
-```
-powertagd -d /dev/xxx -o influxdb \
-  --url http://127.0.0.1:8086 \
-  --org <OrgName> \
-  --bucket <BucketName> \
-  --token <XXX>
-```
-
-Below some sample Flux queries for InfluxDB/Grafana.
+The line-protocol output can also be forwarded to InfluxDB (e.g. via Telegraf
+or another collector). Below some sample Flux queries for InfluxDB/Grafana.
 
 ### Get power values for a specific PowerTag id
 ```
@@ -128,4 +134,3 @@ from(bucket: "powertag")
 ## TODO
 
 - Improve ash protocol error handling
-- Finish MQTT support
